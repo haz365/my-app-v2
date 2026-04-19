@@ -13,92 +13,113 @@ name: Deploy to ECS
 on:
   push:
     branches:
-      - main    # Only trigger on pushes to main branch
-                # Pull requests won't trigger a deployment
+      - main
 
-# These permissions are required for OIDC to work
-# id-token: write = allows GitHub to request an OIDC token
-# contents: read = allows checkout of the repo
 permissions:
   id-token: write
   contents: read
 
 jobs:
-  deploy:
-    name: Build and Deploy
-    runs-on: ubuntu-latest    # Run on GitHub's Ubuntu runners (free)
+  # ─── Job 1: Test ─────────────────────────────────────────
+  test:
+    name: Run tests
+    runs-on: ubuntu-latest
 
     steps:
-      # ─── Step 1: Get the code ────────────────────────────
       - name: Checkout code
         uses: actions/checkout@v4
-        # Clones your repo into the runner's filesystem
 
-      # ─── Step 2: Authenticate to AWS via OIDC ────────────
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: ./app
+
+      - name: Run tests
+        run: npm test
+        working-directory: ./app
+
+  # ─── Job 2: Deploy ───────────────────────────────────────
+  deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Authenticate to AWS via OIDC
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          # The role ARN we created in Terraform
-          # GitHub Actions will assume this role via OIDC
           role-to-assume: arn:aws:iam::989346120260:role/my-app-v2-github-actions-role
           aws-region: eu-west-2
-          # No access keys needed — OIDC handles authentication
 
-      # ─── Step 3: Log Docker into ECR ─────────────────────
+      # ── Check infrastructure exists before deploying ──────
+      # If ECS cluster doesn't exist (terraform not applied yet)
+      # we skip the deploy steps gracefully instead of failing
+      - name: Check if ECS cluster exists
+        id: check-infra
+        run: |
+          if aws ecs describe-clusters \
+            --clusters my-app-v2-cluster \
+            --region eu-west-2 \
+            --query 'clusters[0].status' \
+            --output text 2>/dev/null | grep -q "ACTIVE"; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "✅ Infrastructure found — proceeding with deploy"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "⚠️ Infrastructure not deployed — skipping deploy"
+          fi
+
+      # Log Docker into ECR (only if infra exists)
       - name: Login to Amazon ECR
+        if: steps.check-infra.outputs.exists == 'true'
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
-        # This action gets a temporary ECR password and logs Docker in
-        # Outputs: registry = the ECR registry URL
 
-      # ─── Step 4: Build and push Docker image ─────────────
-      - name: Build, tag and push image to ECR
-        id: build-image
+      # Build and push Docker image (only if infra exists)
+      - name: Build, tag and push image
+        if: steps.check-infra.outputs.exists == 'true'
         env:
-          # The ECR registry URL from the login step above
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           ECR_REPOSITORY: my-app-v2
-          # Use the git commit SHA as the image tag
-          # This gives every build a unique, traceable tag
-          # Much better than always using "latest"
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          # Build for linux/amd64 (required for ECS Fargate)
-          # --platform linux/amd64 ensures correct arch even on ARM runners
           docker build \
             --platform linux/amd64 \
             -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
             -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
             .
 
-          # Push both tags to ECR
-          # - SHA tag: for traceability (know exactly which commit is running)
-          # - latest tag: for convenience
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
-          # Save the full image URI for the next step
-          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+            >> $GITHUB_OUTPUT
 
-      # ─── Step 5: Deploy to ECS ────────────────────────────
+      # Deploy to ECS (only if infra exists)
       - name: Deploy to ECS
-        env:
-          IMAGE_TAG: ${{ github.sha }}
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: my-app-v2
+        if: steps.check-infra.outputs.exists == 'true'
         run: |
-          # Force ECS to pull the new image and restart tasks
-          # ECS will do a rolling deployment:
-          # - Start new task with new image
-          # - Wait for health checks to pass
-          # - Stop old task
-          # - Zero downtime!
           aws ecs update-service \
             --cluster my-app-v2-cluster \
             --service my-app-v2-service \
             --force-new-deployment \
             --region eu-west-2
 
-          echo "✅ Deployment triggered successfully!"
-          echo "Image: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-          echo "Monitor progress in AWS Console → ECS → my-app-v2-cluster"
+          echo "✅ Deployed: ${{ github.sha }}"
+
+      # Friendly message when skipping
+      - name: Skipping deploy (no infrastructure)
+        if: steps.check-infra.outputs.exists == 'false'
+        run: |
+          echo "⚠️ Deploy skipped — run terraform apply first"
+          echo "Once infrastructure exists, push again to deploy"
