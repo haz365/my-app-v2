@@ -1,0 +1,30 @@
+# ─── Node ────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+
+# ─── Environment files (contain secrets!) ────────────
+.env
+.env.*
+
+# ─── Terraform ───────────────────────────────────────
+# Local state (we use S3 instead)
+*.tfstate
+*.tfstate.*
+
+# Terraform working directory (auto-generated on init)
+.terraform/
+.terraform.lock.hcl
+
+# Variable files (may contain secrets)
+*.tfvars
+!example.tfvars
+
+# Crash logs
+crash.log
+
+# ─── macOS ───────────────────────────────────────────
+.DS_Store
+
+# ─── Editor ──────────────────────────────────────────
+.vscode/
+.idea/
